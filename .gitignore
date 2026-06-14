@@ -1,0 +1,9 @@
+# editor / OS cruft
+*~
+*.swp
+.DS_Store
+
+# scratch / local experiments
+scratch/
+*.log
+*.tmp

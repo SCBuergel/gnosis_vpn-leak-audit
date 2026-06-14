@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# gnosis-vpn-demo
+# Monitor raw packet flow through the Gnosis VPN (HOPR) tunnel.
+#
+# Counts are reported EXCLUDING the VPN's own tunnel health-check (gnosis_vpn-root
+# runs `ping -c1 -t6 10.128.0.1` every ~10s to probe the server gateway). Those
+# packets are counted separately (the "hc" column) and not blocked, so the tunnel
+# keeps working — they're just kept out of the "real" rx/tx numbers.
+#
+# Noise sources on this host (2026-06-14 investigation), and how each is handled:
+#   1. Claude Code keepalives (uid 1000)  -> quit Claude for a clean demo.
+#   2. HOPR worker peer self-loop (uid 997, SYN-retransmits to un-bypassed peers,
+#      routed into the tunnel) -> silenced by the uid-997 OUTPUT drop rule below.
+#   3. VPN gateway health-check ping (gnosis_vpn-root, ICMP to 10.128.0.1, ~10s)
+#      -> excluded from the counts here via per-rule iptables accounting.
+#
+# The "real" counts come from iptables accounting rules (need passwordless sudo,
+# which works on this host). If they can't be installed it falls back to the raw
+# /sys interface counters (which include the health-check).
+#
+# Usage:
+#   ./gnosis-vpn-demo            # live per-second rate, health-check excluded
+#   ./gnosis-vpn-demo check      # one-shot: what TCP sockets use the tunnel
+#   ./gnosis-vpn-demo test [N]   # 5s rest baseline, then send N test pings
+#   ./gnosis-vpn-demo counters-off   # remove the accounting rules
+#
+# Host-specific values can be overridden via env vars (see README):
+#   GVPN_IF (tunnel iface), GVPN_GW (in-tunnel server gateway).
+
+set -euo pipefail
+
+IF="${GVPN_IF:-wg0_gnosisvpn}"
+GW="${GVPN_GW:-10.128.0.1}"    # VPN server gateway; target of the health-check ping
+RX="/sys/class/net/$IF/statistics/rx_packets"
+TX="/sys/class/net/$IF/statistics/tx_packets"
+
+command -v ip >/dev/null || { echo "need iproute2"; exit 1; }
+[ -r "$RX" ] || { echo "interface $IF not found — is the VPN up?"; exit 1; }
+
+# Tunnel source IP, derived live from the interface — do NOT hardcode it.
+# WireGuard reassigns this address across reconnects (seen jump .54 -> .90),
+# and a stale value makes the socket filter match nothing => a FALSE "clean"
+# baseline while traffic is actually flowing. Derive it every run instead.
+TUN_IP=$(ip -4 -o addr show "$IF" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+[ -n "$TUN_IP" ] || { echo "could not read $IF address — is the VPN up?"; exit 1; }
+
+SUDO="sudo -n"
+have_counters=0   # set to 1 once iptables accounting is in place
+
+# ---------------------------------------------------------------------------
+# iptables accounting: count "real" tunnel traffic separately from the
+# health-check ICMP to/from the gateway. Rules only RETURN (count + fall
+# through) — nothing is dropped here.
+# ---------------------------------------------------------------------------
+ensure_counters() {
+  $SUDO iptables -nL WGCNT_OUT >/dev/null 2>&1 && { have_counters=1; return; }
+  if ! $SUDO iptables -nL >/dev/null 2>&1; then
+    echo "  (no passwordless sudo for iptables — falling back to raw /sys counts," >&2
+    echo "   which INCLUDE the ~1/10s health-check)" >&2
+    return
+  fi
+  $SUDO iptables -N WGCNT_OUT 2>/dev/null || $SUDO iptables -F WGCNT_OUT
+  $SUDO iptables -A WGCNT_OUT -p icmp -d "$GW" -m comment --comment WGHC_OUT   -j RETURN
+  $SUDO iptables -A WGCNT_OUT          -m comment --comment WGREAL_OUT -j RETURN
+  $SUDO iptables -N WGCNT_IN  2>/dev/null || $SUDO iptables -F WGCNT_IN
+  $SUDO iptables -A WGCNT_IN  -p icmp -s "$GW" -m comment --comment WGHC_IN    -j RETURN
+  $SUDO iptables -A WGCNT_IN           -m comment --comment WGREAL_IN  -j RETURN
+  $SUDO iptables -C OUTPUT -o "$IF" -j WGCNT_OUT 2>/dev/null || $SUDO iptables -A OUTPUT -o "$IF" -j WGCNT_OUT
+  $SUDO iptables -C INPUT  -i "$IF" -j WGCNT_IN  2>/dev/null || $SUDO iptables -A INPUT  -i "$IF" -j WGCNT_IN
+  have_counters=1
+}
+
+teardown_counters() {
+  $SUDO iptables -D OUTPUT -o "$IF" -j WGCNT_OUT 2>/dev/null || true
+  $SUDO iptables -D INPUT  -i "$IF" -j WGCNT_IN  2>/dev/null || true
+  $SUDO iptables -F WGCNT_OUT 2>/dev/null || true; $SUDO iptables -X WGCNT_OUT 2>/dev/null || true
+  $SUDO iptables -F WGCNT_IN  2>/dev/null || true; $SUDO iptables -X WGCNT_IN  2>/dev/null || true
+  echo "accounting rules removed."
+}
+
+# Read one accounting counter (exact packet count) by its rule comment.
+ctr() { $SUDO iptables -nvxL "$1" 2>/dev/null | awk -v c="$2" '$0 ~ c {print $1; exit}'; }
+
+# Echo "real_out real_in hc_out hc_in". Falls back to /sys split across tx/rx
+# (health-check counted as 0) if accounting isn't available.
+read_counts() {
+  if [ "$have_counters" = 1 ]; then
+    echo "$(ctr WGCNT_OUT WGREAL_OUT) $(ctr WGCNT_IN WGREAL_IN) $(ctr WGCNT_OUT WGHC_OUT) $(ctr WGCNT_IN WGHC_IN)"
+  else
+    echo "$(<"$TX") $(<"$RX") 0 0"
+  fi
+}
+
+# Print every TCP socket that is currently egressing via the tunnel, i.e. every
+# process whose traffic is being turned into HOPR packets right now.
+show_talkers() {
+  echo "== Sockets egressing via the tunnel ($TUN_IP) — these become HOPR packets =="
+  # ss always prints a header row even with zero connections, so strip it first
+  # (sed '1d') and test whether any real rows remain.
+  local rows
+  rows=$(ss -tnp state established "src $TUN_IP" 2>/dev/null | sed '1d') || true
+  if [ -n "$rows" ]; then
+    # with `state established`, ss drops the State column: $3=Local $4=Peer $5=Process
+    echo "$rows" | awk '{print $3"  ->  "$4"   "$5}'
+  else
+    echo "  (none — tunnel is quiet, good baseline for the demo)"
+  fi
+}
+
+# Live per-second packet rate, health-check excluded.
+live() {
+  ensure_counters
+  echo "Monitoring $IF  —  Ctrl-C to stop"
+  if [ "$have_counters" = 1 ]; then
+    echo "rx/s & tx/s EXCLUDE the VPN health-check (shown separately as hc/s)."
+    echo "At rest these sit near 0 even though the VPN keeps pinging its gateway."
+  else
+    echo "(raw /sys counts — include the ~1/10s health-check)"
+  fi
+  echo
+  printf "%8s  %8s  %8s  %10s  %8s\n" "rx/s" "tx/s" "tot/s" "running" "hc/s"
+  local po pi pho phi co ci cho chi run=0
+  read po pi pho phi < <(read_counts)
+  while true; do
+    sleep 1
+    read co ci cho chi < <(read_counts)
+    local dtx=$((co-po)) drx=$((ci-pi)) dhc=$(((cho-pho)+(chi-phi)))
+    run=$((run+drx+dtx))
+    printf "%8s  %8s  %8s  %10s  %8s\n" "$drx" "$dtx" "$((drx+dtx))" "$run" "$dhc"
+    po=$co; pi=$ci; pho=$cho; phi=$chi
+  done
+}
+
+# 5s rest baseline, then send a known number of deliberate packets so you can
+# eyeball the 1:1 correspondence — all health-check-excluded.
+test_run() {
+  ensure_counters
+  local n="${1:-20}" o0 i0 ho0 hi0 o1 i1 ho1 hi1
+  echo "== Baseline: 5s at rest (health-check excluded; ~0 even with the VPN pinging) =="
+  read o0 i0 ho0 hi0 < <(read_counts); sleep 5; read o1 i1 ho1 hi1 < <(read_counts)
+  echo "   rest: real_out=$((o1-o0)) real_in=$((i1-i0)) packets in 5s   (health-check excluded: $(((ho1-ho0)+(hi1-hi0))) pkts)"
+  echo
+  echo "== Sending $n deliberate pings to 1.1.1.1 over the tunnel =="
+  read o0 i0 ho0 hi0 < <(read_counts)
+  ping -n -c "$n" -i 0.3 1.1.1.1 >/dev/null 2>&1 || true
+  sleep 1
+  read o1 i1 ho1 hi1 < <(read_counts)
+  echo "   real: out=$((o1-o0)) in=$((i1-i0))  (expect ~$n each + a little overhead; health-check still excluded: $(((ho1-ho0)+(hi1-hi0))) pkts)"
+}
+
+case "${1:-live}" in
+  check)         show_talkers ;;
+  test)          show_talkers; echo; test_run "${2:-20}" ;;
+  live)          show_talkers; echo; live ;;
+  counters-off)  teardown_counters ;;
+  *)             echo "usage: $0 [live|check|test [N]|counters-off]"; exit 1 ;;
+esac

@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# gnosis-vpn-timeline
+# Render a swimlane / state-timeline from a gnosis-vpn-track snapshot log.
+#
+# One row per peer IP (sorted by first-seen), time on the x-axis, each cell colored
+# by the peer's state at that instant:
+#     green = HEALTHY (sourced from eth0, on the bypass list)
+#     red   = LEAKED  (sourced from the tunnel IP -> would be dropped by 'block')
+#     yellow= OTHER   (transient: neither eth0 nor the current tunnel IP)
+#     blank = not present (no socket to that peer at that moment)
+# A top "iface" lane shows tunnel up (·), down (red ▒), and reconnects (cyan |).
+#
+# Reading it: solid green rows = the stable bypass-list peers; speckled red rows =
+# the churning leaked set; a green->red flip near the left edge = the tunnel-up
+# transient (sockets briefly source from eth0 before the catch-all takes over).
+#
+# Usage:
+#   gnosis-vpn-timeline [snapshot.tsv] [max_width]
+#     snapshot.tsv  the file gnosis-vpn-track wrote (default: newest /tmp/gnosis-vpn-track.*.tsv)
+#     max_width     max grid columns; samples are bucketed to fit (default: terminal width or 120)
+#
+# If columns are bucketed, each cell takes the WORST state in its bucket
+# (LEAKED > OTHER > HEALTHY > absent) so a leak is never hidden by aggregation.
+
+set -uo pipefail
+
+TSV="${1:-}"
+if [ -z "$TSV" ]; then
+  TSV=$(ls -t /tmp/gnosis-vpn-track.*.tsv 2>/dev/null | head -1 || true)
+  [ -n "$TSV" ] || { echo "no snapshot file given and none found in /tmp — run gnosis-vpn-track first"; exit 1; }
+  echo "(using newest snapshot: $TSV)"
+fi
+[ -r "$TSV" ] || { echo "cannot read $TSV"; exit 1; }
+
+# default width: leave room for the 15-char label gutter
+term_cols=$(tput cols 2>/dev/null || echo 120)
+MAXW="${2:-$(( term_cols > 40 ? term_cols - 18 : 102 ))}"
+
+# color only on a tty and unless NO_COLOR is set
+COLOR=1
+{ [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; } || COLOR=0
+
+gawk -v width="$MAXW" -v color="$COLOR" '
+BEGIN{
+  FS="\t"; LW=15;
+  if(color){ R="\033[31m"; G="\033[32m"; Y="\033[33m"; C="\033[36m"; D="\033[2m"; X="\033[0m"; B="\033[1m" }
+}
+{
+  e=$1+0; key=$3; val=$4; E[e]=1;
+  if(key=="__IFACE__"){ iface[e]=val; if(val=="DOWN") down[e]=1; next }
+  peers[key]=1; cell[key SUBSEP e]=val;
+  if(!(key in fe) || e<fe[key]){ fe[key]=e; fs[key]=val }
+  le[key]=e; ls[key]=val; cnt[key]++;
+}
+function glyph(s){
+  if(s=="LEAKED")  return R "█" X;
+  if(s=="HEALTHY") return G "█" X;
+  if(s=="OTHER")   return Y "█" X;
+  return " ";
+}
+# worst state across the samples in column c (1-based)
+function colstate(p, c,   i,lo,hi,s,best){
+  lo=(c-1)*bucket+1; hi=c*bucket; if(hi>T) hi=T; best="";
+  for(i=lo;i<=hi;i++){ s=cell[p SUBSEP EL[i]];
+    if(s=="LEAKED") return "LEAKED";
+    if(s=="OTHER") best="OTHER";
+    else if(s=="HEALTHY" && best=="") best="HEALTHY";
+  }
+  return best;
+}
+function ifaceglyph(c,   i,lo,hi,d,prev,cur,chg){
+  lo=(c-1)*bucket+1; hi=c*bucket; if(hi>T) hi=T; d=0; chg=0; prev="";
+  for(i=lo;i<=hi;i++){ cur=iface[EL[i]];
+    if(down[EL[i]]) d=1;
+    if(prev!="" && cur!="" && cur!=prev && cur!="DOWN" && prev!="DOWN") chg=1;
+    if(cur!="") prev=cur;
+  }
+  if(d) return R "▒" X;
+  if(chg) return C "|" X;
+  return D "·" X;
+}
+END{
+  T=0; PROCINFO["sorted_in"]="@ind_num_asc";
+  for(e in E){ T++; EL[T]=e }                 # EL[1..T] = sorted distinct elapsed
+  if(T==0){ print "empty snapshot"; exit }
+  bucket=1; if(width>0 && T>width) bucket=int((T+width-1)/width);
+  ncol=int((T+bucket-1)/bucket);
+  span=EL[T]-EL[1];
+
+  printf "%speers over time%s  —  %d samples, %ds span, %d cols", B, X, T, span, ncol;
+  if(bucket>1) printf " (each col ≈ %d samples / ~%ds, worst-state)", bucket, int(span/ncol)+1;
+  printf "\n";
+  print "legend: " G "█" X "=healthy(eth0)  " R "█" X "=leaked(tunnel)  " Y "█" X "=other  ·=absent   iface: " D "·" X "=up " R "▒" X "=down " C "|" X "=reconnect";
+  print "";
+
+  # iface lane
+  row="";
+  for(c=1;c<=ncol;c++) row=row ifaceglyph(c);
+  printf "%-*s %s\n", LW, "iface", row;
+
+  # peer lanes, ordered by first-seen then ip
+  for(p in peers) ord[sprintf("%09d\t%s", fe[p], p)] = p;
+  PROCINFO["sorted_in"]="@ind_str_asc";
+  for(k in ord){
+    p=ord[k]; row="";
+    for(c=1;c<=ncol;c++) row=row glyph(colstate(p,c));
+    f=substr(fs[p],1,1); l=substr(ls[p],1,1);
+    printf "%-*s %s  %s→%s +%ds x%d\n", LW, p, row, f, l, fe[p], cnt[p];
+  }
+
+  # x-axis ruler + labels (markers every 10 cols)
+  ruler=""; for(c=1;c<=ncol;c++) ruler=ruler (((c-1)%10==0)?"+":"·");
+  printf "%-*s %s\n", LW, "", ruler;
+  labels=""; for(c=1;c<=ncol;c+=10) labels=labels sprintf("%-10s", EL[(c-1)*bucket+1] "s");
+  printf "%-*s %s\n", LW, "", labels;
+}
+' "$TSV"

@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# gnosis-vpn-track
+# Longitudinal tracker for the worker's HOPR peer dials. Samples `ss` on an
+# interval and records, per peer IP, the moment it FIRST appeared and whether it
+# was LEAKED (sourced from the tunnel IP -> would be blocked) or HEALTHY (sourced
+# from eth0) at that moment — plus any later state transitions and presence flaps.
+#
+# Motivation: leaks don't show up the instant the tunnel comes up. After a
+# (re)connect the worker rediscovers peers over several seconds, so the leaked set
+# builds up — and churns — over time. A single `show` is a snapshot; this watches
+# it evolve. Reconnects (interface down / tunnel-IP change) are detected and logged.
+#
+# No root needed: TCP socket addresses/states are world-readable via /proc/net/tcp,
+# and classification is purely by source IP (we don't need the process column).
+#
+# Usage:
+#   ./gnosis-vpn-track [interval_sec] [duration_sec]
+#     interval_sec  poll period                         (default 1)
+#     duration_sec  total run time, 0 = until Ctrl-C    (default 0)
+#
+#   GVPN_IF overrides the tunnel interface (default wg0_gnosisvpn).
+#
+# Output: a live event log (one line per NEW peer / state CHG / BACK / GONE /
+# reconnect), then a summary table sorted by first-seen on exit.
+
+set -uo pipefail   # NOT -e: a transient ss/ip error mid-reconnect must not kill the run
+
+IF="${GVPN_IF:-wg0_gnosisvpn}"
+INTERVAL="${1:-1}"
+DURATION="${2:-0}"
+
+command -v ip >/dev/null || { echo "need iproute2"; exit 1; }
+command -v ss >/dev/null || { echo "need ss (iproute2)"; exit 1; }
+
+declare -A FIRST_CLOCK FIRST_ELAPSED FIRST_STATE LAST_STATE SEEN TRANS PREV_PRESENT
+start=$(date +%s)
+prev_tun=""        # "" = first tick, "__down__" = iface was down last tick, else last tunnel IP
+
+# Per-second snapshot log for the timeline renderer. One row per observation:
+#   <elapsed>\t<clock>\t<peer_ip|__IFACE__>\t<HEALTHY|LEAKED|OTHER|tunnel_ip|DOWN>
+# Render it with: gnosis-vpn-timeline <file>
+TSV="${GVPN_TSV:-/tmp/gnosis-vpn-track.$$.tsv}"
+: > "$TSV"
+
+# Emit, for the current instant: "__TUN__ <ip>" (or "__DOWN__") followed by one
+# "<peer_ip> <LEAKED|HEALTHY|OTHER>" line per worker peer socket.
+sample() {
+  local tun eth
+  tun=$(ip -4 -o addr show "$IF" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+  eth=$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+  [ -n "$tun" ] || { echo "__DOWN__"; return; }
+  echo "__TUN__ $tun"
+  # Scan for the two ip:port tokens on each row (Local then Peer); robust to ss's
+  # column shifts. Listener rows (peer "0.0.0.0:*") have no second token -> skipped.
+  ss -tnH 'sport = 9091 or dport = 9091' 2>/dev/null | awk -v t="$tun" -v e="$eth" '
+    { src=""; peer=""; n=0
+      for (i=1;i<=NF;i++) if ($i ~ /^[0-9.]+:[0-9]+$/) { n++; if (n==1) src=$i; else if (n==2) { peer=$i; break } }
+      if (peer=="") next
+      split(peer,pp,":"); split(src,sp,":")
+      st = (sp[1]==t) ? "LEAKED" : (sp[1]==e ? "HEALTHY" : "OTHER")
+      print pp[1], st
+    }'
+}
+
+summary() {
+  echo
+  echo "==== summary: peers by first-seen ($(date +%H:%M:%S), ran ${1:-?}s) ===="
+  printf '%-10s %-8s %-16s %-8s %-8s %-7s %-5s\n' \
+    "first@" "elapsed" "peer_ip" "first" "last" "samples" "chg"
+  local nl=0 nh=0
+  { for ip in "${!FIRST_ELAPSED[@]}"; do printf '%s\t%s\n' "${FIRST_ELAPSED[$ip]}" "$ip"; done | sort -n; } \
+  | while IFS=$'\t' read -r el ip; do
+      printf '%-10s +%-7s %-16s %-8s %-8s %-7s %-5s\n' \
+        "${FIRST_CLOCK[$ip]}" "${el}s" "$ip" "${FIRST_STATE[$ip]}" "${LAST_STATE[$ip]}" "${SEEN[$ip]}" "${TRANS[$ip]}"
+    done
+  for ip in "${!FIRST_STATE[@]}"; do
+    [ "${FIRST_STATE[$ip]}" = LEAKED ]  && nl=$((nl+1))
+    [ "${FIRST_STATE[$ip]}" = HEALTHY ] && nh=$((nh+1))
+  done
+  echo
+  echo "distinct peers: ${#FIRST_STATE[@]}   first-seen LEAKED: $nl   first-seen HEALTHY: $nh"
+  echo "(LEAKED = sourced from the tunnel IP at first sight = would be dropped by 'block')"
+  echo
+  echo "timeline:  gnosis-vpn-timeline $TSV"
+}
+
+trap 'summary "$(( $(date +%s)-start ))"; exit 0' INT TERM
+
+echo "tracking $IF every ${INTERVAL}s$([ "$DURATION" != 0 ] && echo ", for ${DURATION}s" || echo ", until Ctrl-C")"
+echo "snapshot log: $TSV  (render: gnosis-vpn-timeline $TSV)"
+echo "time      elapsed  event"
+while :; do
+  now=$(date +%s); elapsed=$((now-start)); clock=$(date +%H:%M:%S)
+  mapfile -t lines < <(sample)
+
+  cur_tun=""; down=0
+  declare -A now_present=() now_state=()
+  for ln in "${lines[@]}"; do
+    case "$ln" in
+      __DOWN__)  down=1 ;;
+      __TUN__*)  cur_tun="${ln#__TUN__ }" ;;
+      *)
+        ip="${ln%% *}"; st="${ln##* }"
+        now_present[$ip]=1; now_state[$ip]=$st
+        if [ -z "${SEEN[$ip]:-}" ]; then
+          FIRST_CLOCK[$ip]=$clock; FIRST_ELAPSED[$ip]=$elapsed
+          FIRST_STATE[$ip]=$st; LAST_STATE[$ip]=$st; SEEN[$ip]=1; TRANS[$ip]=0
+          printf '[%s] +%4ds  NEW   %-15s %s\n' "$clock" "$elapsed" "$ip" "$st"
+        else
+          SEEN[$ip]=$(( SEEN[$ip] + 1 ))
+          [ -z "${PREV_PRESENT[$ip]:-}" ] && \
+            printf '[%s] +%4ds  BACK  %-15s %s\n' "$clock" "$elapsed" "$ip" "$st"
+          if [ "${LAST_STATE[$ip]}" != "$st" ]; then
+            printf '[%s] +%4ds  CHG   %-15s %s -> %s\n' "$clock" "$elapsed" "$ip" "${LAST_STATE[$ip]}" "$st"
+            LAST_STATE[$ip]=$st; TRANS[$ip]=$(( TRANS[$ip] + 1 ))
+          fi
+        fi
+        ;;
+    esac
+  done
+
+  # reconnect / interface-state transitions
+  if [ "$down" = 1 ]; then
+    [ "$prev_tun" != "__down__" ] && printf '[%s] +%4ds  DOWN  %s not up (reconnecting?)\n' "$clock" "$elapsed" "$IF"
+    prev_tun="__down__"
+  else
+    if [ "$prev_tun" = "__down__" ]; then
+      printf '[%s] +%4ds  UP    tunnel %s\n' "$clock" "$elapsed" "$cur_tun"
+    elif [ -n "$prev_tun" ] && [ "$prev_tun" != "$cur_tun" ]; then
+      printf '[%s] +%4ds  RECON tunnel %s -> %s (peer set will repopulate)\n' "$clock" "$elapsed" "$prev_tun" "$cur_tun"
+    fi
+    prev_tun="$cur_tun"
+  fi
+
+  # peers that were present last tick but not now
+  for ip in "${!PREV_PRESENT[@]}"; do
+    [ -z "${now_present[$ip]:-}" ] && \
+      printf '[%s] +%4ds  GONE  %-15s (last %s)\n' "$clock" "$elapsed" "$ip" "${LAST_STATE[$ip]}"
+  done
+
+  unset PREV_PRESENT; declare -A PREV_PRESENT
+  for ip in "${!now_present[@]}"; do PREV_PRESENT[$ip]=1; done
+
+  # append this tick's raw snapshot for the timeline renderer
+  if [ "$down" = 1 ]; then
+    printf '%s\t%s\t__IFACE__\tDOWN\n' "$elapsed" "$clock" >> "$TSV"
+  else
+    printf '%s\t%s\t__IFACE__\t%s\n' "$elapsed" "$clock" "$cur_tun" >> "$TSV"
+    for ip in "${!now_state[@]}"; do
+      printf '%s\t%s\t%s\t%s\n' "$elapsed" "$clock" "$ip" "${now_state[$ip]}" >> "$TSV"
+    done
+  fi
+
+  [ "$DURATION" != 0 ] && [ "$elapsed" -ge "$DURATION" ] && break
+  sleep "$INTERVAL"
+done
+summary "$elapsed"

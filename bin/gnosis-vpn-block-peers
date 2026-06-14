@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# gnosis-vpn-block-peers
+#
+# Identify the HOPR peers that the Gnosis VPN worker (uid 997) is wrongly dialing
+# INTO its own tunnel, display them, and block those dials.
+#
+# Background: the worker (gnosis_vpn-worker, uid 997) dials peers on tcp/9091.
+# Peers not in the static /32 bypass list fall through the 0.0.0.0/1 catch-all and
+# get routed into wg0_gnosisvpn -> they can never connect (HOPR-through-HOPR), so
+# they sit in SYN-SENT and the kernel retransmits SYNs forever (~25 pkt/s floor).
+# The classifier is the SOURCE IP: a :9091 socket sourced from the *tunnel* IP is
+# misrouted; one sourced from eth0 is fine. See docs/routing-bug.md.
+#
+# Blocking strategy: a single uid-scoped OUTPUT DROP on the tunnel. This kills every
+# misrouted dial — current AND future — without an IP list, because the worker's
+# legit traffic uses eth0, never the tunnel. (Per-IP drops are fragile: HOPR
+# discovers peers dynamically, so a snapshot of stuck IPs goes stale immediately.)
+# Both modes are provided; the uid mode is the default and the recommended one.
+#
+# Usage:
+#   ./gnosis-vpn-block-peers            # identify + display, then block (uid mode)
+#   ./gnosis-vpn-block-peers show       # identify + display only, no changes
+#   ./gnosis-vpn-block-peers block      # display + uid-scoped DROP (recommended)
+#   ./gnosis-vpn-block-peers block-ips  # display + one DROP per currently-stuck peer IP
+#   ./gnosis-vpn-block-peers status     # show which block rules are installed + hit counts
+#   ./gnosis-vpn-block-peers unblock    # remove all block rules this script installs
+#
+# Host-specific values can be overridden via env vars (see README):
+#   GVPN_IF (tunnel iface), GVPN_WORKER_UID (uid of gnosis_vpn-worker).
+
+set -euo pipefail
+
+IF="${GVPN_IF:-wg0_gnosisvpn}"
+WORKER_UID="${GVPN_WORKER_UID:-997}"
+TAG="GVPN_BLOCK"            # comment tag so we can find/remove exactly our rules
+
+command -v ip >/dev/null || { echo "need iproute2"; exit 1; }
+ip link show "$IF" >/dev/null 2>&1 || { echo "interface $IF not found — is the VPN up?"; exit 1; }
+
+SUDO="sudo -n"
+$SUDO iptables -nL >/dev/null 2>&1 || { echo "need passwordless sudo for iptables"; exit 1; }
+
+# Tunnel source IP, derived live every run — it drifts across reconnects (seen
+# .54 -> .90 -> .60). A stale value would misclassify every socket.
+TUN_IP=$(ip -4 -o addr show "$IF" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+ETH_IP=$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+[ -n "$TUN_IP" ] || { echo "could not read $IF address — is the VPN up?"; exit 1; }
+
+# Echo the currently-stuck (misrouted) peer IPs: :9091 sockets sourced from the
+# tunnel IP. One per line, sorted/unique.
+stuck_ips() {
+  $SUDO ss -tnH 'sport = 9091 or dport = 9091' 2>/dev/null \
+    | awk -v t="$TUN_IP" '$0 ~ t {for(i=1;i<=NF;i++) if($i ~ "^"t":"){ };
+        # find the peer field: the token that is ip:port and is NOT the tunnel-sourced local addr
+        for(i=1;i<=NF;i++){ if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/ && $i !~ "^"t":"){ split($i,p,":"); print p[1]; break } } }' \
+    | sort -u
+}
+
+# Display the current picture: misrouted (stuck) vs working peers.
+show() {
+  echo "== Gnosis VPN worker peer dials  (tunnel=$TUN_IP  eth0=$ETH_IP) =="
+  echo
+  local stuck working
+  stuck=$($SUDO ss -tnpH 'sport = 9091 or dport = 9091' 2>/dev/null | grep "$TUN_IP" || true)
+  working=$($SUDO ss -tnpH state established 'sport = 9091 or dport = 9091' 2>/dev/null | grep "$ETH_IP" || true)
+
+  echo "MISROUTED into the tunnel (SYN-SENT, can never connect):"
+  if [ -n "$stuck" ]; then
+    # No state filter => ss keeps the State column: $4=Local(src) $5=Peer.
+    echo "$stuck" | awk '{print "  ✗  "$5"   (src "$4")"}'
+  else
+    echo "  (none right now)"
+  fi
+  echo
+  echo "WORKING via eth0 (ESTABLISHED) — leave these alone:"
+  if [ -n "$working" ]; then
+    echo "$working" | awk '{print "  ✓  "$4"   (src "$3")"}'
+  else
+    echo "  (none right now)"
+  fi
+  echo
+  local ips; ips=$(stuck_ips)
+  local n=0; [ -n "$ips" ] && n=$(echo "$ips" | grep -c .)
+  echo "Stuck peer count: $n"
+  [ -n "$ips" ] && { echo "Stuck peer IPs:"; echo "$ips" | sed 's/^/  /'; }
+}
+
+# Recommended: one uid-scoped DROP that covers all current + future misrouted dials.
+block_uid() {
+  if $SUDO iptables -C OUTPUT -o "$IF" -m owner --uid-owner "$WORKER_UID" \
+        -m comment --comment "$TAG" -j DROP 2>/dev/null; then
+    echo "uid-scoped block already installed."
+  else
+    $SUDO iptables -A OUTPUT -o "$IF" -m owner --uid-owner "$WORKER_UID" \
+        -m comment --comment "$TAG" -j DROP
+    echo "Installed: DROP all uid-$WORKER_UID (worker) traffic egressing $IF."
+    echo "This stops every misrouted peer dial — current and future — at the source."
+  fi
+}
+
+# Alternative: one DROP per currently-stuck peer IP (snapshot; will go stale).
+block_ips() {
+  local ips; ips=$(stuck_ips)
+  [ -n "$ips" ] || { echo "No stuck peers right now — nothing to block."; return; }
+  local n=0
+  while read -r ip; do
+    [ -n "$ip" ] || continue
+    if $SUDO iptables -C OUTPUT -o "$IF" -d "$ip" -m comment --comment "$TAG" -j DROP 2>/dev/null; then
+      echo "  already blocked: $ip"
+    else
+      $SUDO iptables -A OUTPUT -o "$IF" -d "$ip" -m comment --comment "$TAG" -j DROP
+      echo "  blocked: $ip"
+      n=$((n+1))
+    fi
+  done <<< "$ips"
+  echo "Added $n per-IP DROP rule(s)."
+  echo "NOTE: HOPR discovers peers dynamically — new stuck peers will appear that"
+  echo "      this snapshot does not cover. Prefer 'block' (uid mode) for durability."
+}
+
+# Show installed block rules + how many packets each has dropped.
+status() {
+  echo "== Installed $TAG rules in OUTPUT (pkts bytes target ... ) =="
+  local rules
+  rules=$($SUDO iptables -nvxL OUTPUT 2>/dev/null | grep "$TAG" || true)
+  if [ -n "$rules" ]; then
+    echo "$rules"
+  else
+    echo "  (none installed)"
+  fi
+}
+
+# Remove every rule this script installs (matched by the comment tag).
+unblock() {
+  local removed=0
+  # Loop because rule numbers shift as we delete; re-query each pass.
+  while $SUDO iptables -nL OUTPUT --line-numbers 2>/dev/null | grep -q "$TAG"; do
+    local ln
+    ln=$($SUDO iptables -nL OUTPUT --line-numbers 2>/dev/null | awk -v t="$TAG" '$0 ~ t {print $1; exit}')
+    [ -n "$ln" ] || break
+    $SUDO iptables -D OUTPUT "$ln"
+    removed=$((removed+1))
+  done
+  echo "Removed $removed $TAG rule(s)."
+}
+
+case "${1:-block}" in
+  show)      show ;;
+  block)     show; echo; block_uid ;;
+  block-ips) show; echo; block_ips ;;
+  status)    status ;;
+  unblock)   unblock ;;
+  *) echo "usage: $0 [show|block|block-ips|status|unblock]"; exit 1 ;;
+esac
