@@ -111,8 +111,9 @@ the experimental control).
 
 ### 4.1 Instantaneous classification (P1, P3)
 
-A representative snapshot immediately after a fresh connect (worker `gnosis_vpn-worker`,
-pid 1827; all dials same process, same port):
+A representative snapshot in settled steady state (≥30 s after connect; see §4.3 for
+why settling matters), worker `gnosis_vpn-worker`, pid 1827, all dials same process and
+port:
 
 | Peer IP | In exception set | Egress source | TCP state |
 |---|---|---|---|
@@ -156,28 +157,57 @@ worker rotates through non-excepted peers). Two snapshots taken 8 s apart shared
 1 of ~5 tunnelled peers (Jaccard ≈ 0.1), confirming rapid turnover. **P2 holds:**
 coverage is a minority, the excepted set is stable, the tunnelled set churns.
 
-### 4.3 State is fixed by membership, with a connection-time transient (P5)
+### 4.3 Connection-time transient: a ~10 s grace window of full coverage (P5)
 
-In steady state, no peer transitions between excepted and tunnelled (`transitions = 0`
-for every peer across the window) — classification is a function of static-list
-membership, exactly as P5 predicts.
-
-The one exception is a transient at connection time. Across a reconnect, **all** peers
-(including normally-tunnelled ones) first appear **excepted** for ~1–2 s, then the
-non-listed peers flip to **tunnelled** and stay there:
+Steady-state classification is fixed by exception-set membership (`transitions = 0`
+per peer within a settled window) — as P5 predicts. But recording *from before the
+tunnel comes up* reveals a substantial startup transient that a single early snapshot
+would miss entirely. With the sampler already running, the link was cycled
+(`gnosis_vpn-ctl disconnect; gnosis_vpn-ctl connect UK`, DNS restored ~1 s later);
+Figure 2 shows every second from before connect (`=` excepted, `#` tunnelled, blank
+absent):
 
 ```
-[+15s] UP    tunnel 10.128.0.59
-[+15s] NEW   34.141.57.130   HEALTHY      # appears excepted at first…
-[+17s] CHG   34.141.57.130   HEALTHY -> LEAKED   # …then flips once catch-all applies
-[+26s] CHG   34.89.170.79    HEALTHY -> LEAKED
-[+27s] CHG   34.89.169.146   HEALTHY -> LEAKED
+Figure 2 — reconnect from a cold start (1 col = 1 s); first 52 s of an 89 s capture
+
+iface           xxxxxxxxx...........................................
+34.141.57.130            ==========         ##########           ###
+34.141.68.157            ==========         ##########           ###
+34.179.176.136           ==========         ##########           ###
+34.179.192.95            ==========         ##########           ###
+34.185.189.141           ===========================================   <- curated
+34.89.169.146            ==========         ##########           ###
+34.89.170.79             ==========         ##########           ###
+35.198.136.5             ==========         ##########           ###
+35.242.223.88            ===========================================   <- curated
+35.246.241.197           ==========         ##########           ###
+                +---------+---------+---------+---------+---------+-
+                0s        10s       20s       31s       41s       51s
 ```
 
-This is consistent with the catch-all `/1` routes being installed a moment *after* the
-interface appears: during that window the `eth0` default still applies to every dial.
-It is a startup artifact, not steady-state behaviour, but it explains why a single
-early snapshot can understate the tunnelled fraction.
+```
+[+0s]  DOWN  wg0_gnosisvpn not up
+[+9s]  UP    tunnel 10.128.0.172
+[+9s]  NEW   <all 10 peers>  HEALTHY            # everything excepted at first
+[+28s] CHG   34.89.169.146   HEALTHY -> LEAKED  # the 8 non-curated peers flip…
+[+28s] CHG   … (8 peers)     HEALTHY -> LEAKED  # …once the catch-all governs new dials
+```
+
+The interface is down for 9 s; at connect, **all 10 dialled peers appear excepted**
+(sourced from eth0) and connect — *including the 8 not in the static set*. Only after
+~10 s do those 8 sockets recycle and re-dial, now routed through the tunnel, settling
+into the churning steady state of §4.2. The two curated peers stay excepted throughout
+(`x80` of 80 post-connect samples).
+
+Interpretation: for roughly the first 10–19 s after the interface appears, the
+catch-all `/1` routes do not yet govern the worker's sockets, so the node briefly
+reaches its **entire** peer set; once the catch-all is in force and sockets recycle,
+coverage collapses to the static set and the ~80% tunnelled majority emerges. Two
+consequences: (i) **coverage is time-dependent** — a snapshot taken in the first ~20 s
+after connect shows ~100% coverage and badly understates the steady-state gap, so
+measurements must be allowed to settle (≥~30 s); (ii) the transient itself is benign
+(it briefly *improves* reachability) but is a startup artifact, not the design's
+steady-state behaviour.
 
 ### 4.4 Traffic cost (P4)
 
@@ -257,6 +287,14 @@ bin/gnosis-vpn-block-peers show
 # §4.2  capture 45 s at 1 Hz, then render the timeline
 bin/gnosis-vpn-track 1 45
 bin/gnosis-vpn-timeline
+
+# §4.3  cold-start: record from BEFORE connect through settling (one shell, so it
+#       survives the brief offline window while the link is down). Start the sampler,
+#       then cycle the link and restore DNS ~1 s after connect.
+GVPN_TSV=/tmp/gv-reconnect.tsv bin/gnosis-vpn-track 1 90 &
+sleep 4; gnosis_vpn-ctl disconnect; sleep 1; gnosis_vpn-ctl connect UK
+sleep 1; echo "nameserver 1.1.1.1" | sudo tee /etc/resolv.conf >/dev/null
+wait; bin/gnosis-vpn-timeline /tmp/gv-reconnect.tsv
 
 # §4.4  attribute the idle floor (control = drop the worker's tunnel egress)
 IF=wg0_gnosisvpn
